@@ -1,0 +1,179 @@
+#!/bin/bash
+
+# -------------------------------------------------------------------------- #
+# Copyright 2002-2019, OpenNebula Project, OpenNebula Systems                #
+#                                                                            #
+# Licensed under the Apache License, Version 2.0 (the "License"); you may    #
+# not use this file except in compliance with the License. You may obtain    #
+# a copy of the License at                                                   #
+#                                                                            #
+# http://www.apache.org/licenses/LICENSE-2.0                                 #
+#                                                                            #
+# Unless required by applicable law or agreed to in writing, software        #
+# distributed under the License is distributed on an "AS IS" BASIS,          #
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.   #
+# See the License for the specific language governing permissions and        #
+# limitations under the License.                                             #
+#--------------------------------------------------------------------------- #
+
+# mkimage size format host:remote_system_ds/disk.i vmid dsid
+#   - size in MB of the image
+#   - format for the image
+#   - host is the target host to deploy the VM
+#   - remote_system_ds is the path for the system datastore in the host
+#   - vmid is the id of the VM
+#   - dsid is the target datastore (0 is the system datastore)
+
+SIZE=$1
+FORMAT=$2
+DST=$3
+
+VMID=$4
+DSID=$5
+
+#-------------------------------------------------------------------------------
+
+if [ -z "${ONE_LOCATION}" ]; then
+    TMCOMMON=/var/lib/one/remotes/tm/tm_common.sh
+    LIB_LOCATION=/usr/lib/one
+else
+    TMCOMMON=$ONE_LOCATION/var/remotes/tm/tm_common.sh
+    LIB_LOCATION=$ONE_LOCATION/lib
+fi
+
+DRIVER_PATH=$(dirname $0)
+
+source $TMCOMMON
+
+source ${DRIVER_PATH}/../../etc/datastore/zfs_iscsi/zfs.conf
+source ${DRIVER_PATH}/../../datastore/libfs.sh
+
+ZFS_UTILS=${DRIVER_PATH}/../../datastore/zfs_iscsi/zfs_utils.sh
+
+#-------------------------------------------------------------------------------
+# Set dst path and dir
+#-------------------------------------------------------------------------------
+
+DST_PATH=`arg_path $DST`
+NODE_HOST=`arg_host $DST`
+DST_DIR=`dirname $DST_PATH`
+
+DISK_ID=$(echo $DST|awk -F. '{print $NF}')
+
+#-------------------------------------------------------------------------------
+#  Get Image information
+#-------------------------------------------------------------------------------
+
+XPATH="${DRIVER_PATH}/../../datastore/xpath.rb --stdin"
+
+unset i j XPATH_ELEMENTS
+
+while IFS= read -r -d '' element; do
+        XPATH_ELEMENTS[i++]="$element"
+done < <(onevm show -x $VMID | $XPATH  \
+                            /VM/TEMPLATE/DISK[DISK_ID=$DISK_ID]/POOL_NAME \
+			    /VM/TEMPLATE/DISK[DISK_ID=$DISK_ID]/FS )
+
+POOL_NAME="${XPATH_ELEMENTS[j++]:-$POOL_NAME}"
+FS="${XPATH_ELEMENTS[j++]}"
+
+unset i j XPATH_ELEMENTS
+
+while IFS= read -r -d '' element; do
+        XPATH_ELEMENTS[i++]="$element"
+done < <(onedatastore show -x $DSID| $XPATH  \
+                    /DATASTORE/TEMPLATE/BRIDGE_LIST \
+                    /DATASTORE/TEMPLATE/ISCSI_USER \
+                    /DATASTORE/TEMPLATE/ISCSI_PWD )
+
+BRIDGE_LIST="${XPATH_ELEMENTS[j++]}"
+ISCSI_USER="${XPATH_ELEMENTS[j++]}"
+ISCSI_PWD="${XPATH_ELEMENTS[j++]:-$ISCSI_PWD}"
+
+DST_HOST=`get_destination_host $VMID`
+
+if [ -z "$DST_HOST" ]; then
+    error_message "Datastore template missing 'BRIDGE_LIST' attribute."
+    exit -1
+fi
+
+IMAGE_NAME="one-sys-${VMID}-${DISK_ID}"
+ZVOL_SOURCE="${POOL_NAME}/$IMAGE_NAME"
+ZVOL_DEV="/dev/zvol/$ZVOL_SOURCE"
+ZVOL_IQN="iqn.2008-07.org.opennebula:${IMAGE_NAME}"
+
+ISCSI_PWD=$(echo "$ISCSI_PWD" | base64 --decode)
+
+ssh_make_path $NODE_HOST $DST_DIR
+
+set -e -o pipefail
+
+TMP_DST="/tmp/raw.disk"
+
+# if user requested a swap or specifies a FS, we need to create a local
+# formatted image and upload into existing Zvol image
+FS_OPTS=$(eval $(echo "echo \$FS_OPTS_$FS"))
+MKFS_CMD=`mkfs_command $TMP_DST $FORMAT $SIZE "$SUPPORTED_FS" "$FS" "$FS_OPTS"`
+
+MKIMAGE_CMD=$(cat <<EOF
+    set -e -o pipefail
+
+    export PATH=/usr/sbin:/sbin:\$PATH
+
+    $SUDO zfs create -V ${SIZE}M $ZVOL_SOURCE
+    $SUDO zfs set refreservation=none $ZVOL_SOURCE
+
+    TIMEOUT=0
+    until [ -b /dev/zvol/$ZVOL_SOURCE ]; do
+        sleep 1 && let "TIMEOUT +=1"
+        if [ "$TIMEOUT" -gt "10" ]; then
+            error_message "Error makefs $ZVOL_SOURCE in $DST_HOST, volume does not appear"
+            exit -1
+        fi
+    done
+
+    $SUDO targetcli /backstores/block create ${IMAGE_NAME} /dev/zvol/$ZVOL_SOURCE
+    $SUDO targetcli /backstores/block/${IMAGE_NAME} set attribute emulate_tpu=1
+    $SUDO targetcli /iscsi create $ZVOL_IQN
+    $SUDO targetcli /iscsi/$ZVOL_IQN/tpg1 set attribute authentication=1
+    $SUDO targetcli /iscsi/$ZVOL_IQN/tpg1 set attribute generate_node_acls=1
+    $SUDO targetcli /iscsi/$ZVOL_IQN/tpg1 set attribute demo_mode_write_protect=0
+    $SUDO targetcli /iscsi/$ZVOL_IQN/tpg1 set auth userid=$ISCSI_USER
+    $SUDO targetcli /iscsi/$ZVOL_IQN/tpg1 set auth password=$ISCSI_PWD
+    $SUDO targetcli /iscsi/$ZVOL_IQN/tpg1/luns create /backstores/block/${IMAGE_NAME}
+    $SUDO targetcli saveconfig
+
+    if [ ! -z "${FS}" ] || [ "$FORMAT" = "swap" ]; then
+       ${MKFS_CMD}
+       $SUDO $DD if=${TMP_DST} of=/dev/zvol/$ZVOL_SOURCE bs=64k
+       ${RM} -f "${TMP_DST}"
+    fi
+EOF
+)
+
+DELIMAGE_CMD=$(cat <<EOF
+    export PATH=/usr/sbin:/sbin:\$PATH
+
+    $SUDO targetcli /backstores/block delete $IMAGE_NAME
+    $SUDO targetcli /iscsi delete $ZVOL_IQN
+    $SUDO targetcli saveconfig
+
+    $SUDO zfs destroy $ZVOL_SOURCE
+
+    ${RM} -f "${TMP_DST}"
+EOF
+)
+
+log "Making volatile disk of ${SIZE}M at $DST_HOST"
+
+ssh_exec_and_log_no_error "$DST_HOST" "$MKIMAGE_CMD" \
+    "Error creating volatile disk.$DISK_ID ($ZVOL_SOURCE) in $DST_HOST into pool $POOL_NAME."
+
+rc=$?
+
+if [ $rc != 0 ]; then
+    ssh_exec_and_log_no_error "$DST_HOST" "$DELIMAGE_CMD" \
+        "Error removing image"
+fi
+
+exit $rc
