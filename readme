@@ -1,0 +1,235 @@
+# zfs_iscsi
+Opennebula Integration for zfs driver over iscsi
+
+
+
+###SAN
+addgroup --system --gid 9869 oneadmin
+adduser --system --home /var/lib/one --shell /bin/bash --uid 9869 --gid 9869 --disabled-password --disabled-login oneadmin
+chown -R oneadmin:oneadmin /var/lib/one/
+
+-rsync /var/lib/one/.ssh 
+
+-sudoers
+
+/etc/sudoers.d/opennebula
+Cmnd_Alias ONE_ZFS = /bin/dd, /sbin/zfs, /usr/bin/targetcli
+
+/etc/sudoers.d/opennebula-node-kvm
+oneadmin ALL=(ALL:ALL) NOPASSWD: ONE_CEPH, ONE_NET, ONE_OVS, ONE_LVM, ONE_MEM, ONE_ZFS
+
+/etc/sudoers.d/opennebula-server
+oneadmin ALL=(ALL) NOPASSWD: ONE_CEPH, ONE_HA, ONE_MARKET, ONE_ZFS
+
+
+###FRONTEND
+/etc/one/vmm_exec/vmm_execrc
+LIVE_DISK_SNAPSHOTS="kvm-qcow2 kvm-ceph kvm-ssh kvm-zfs_iscsi"
+
+/etc/one/vmm_exec/vmm_exec_kvm.conf
+DISK = [
+    DRIVER  = "raw",
+    CACHE   = "none",
+    DISCARD = "unmap",
+    IO      = "native"
+]
+......
+SPICE_OPTIONS = "
+    <video>
+        <model type='qxl' heads='1'/>
+    </video>
+
+
+/etc/one/oned.conf
+TM_MAD = [
+    EXECUTABLE = "one_tm",
+    ARGUMENTS = "-t 15 -d dummy,lvm,shared,fs_lvm,qcow2,ssh,ceph,dev,vcenter,iscsi_libvirt,zfs_iscsi"
+]
+......
+DATASTORE_MAD = [
+    EXECUTABLE = "one_datastore",
+    ARGUMENTS  = "-t 15 -d dummy,fs,lvm,ceph,dev,iscsi_libvirt,vcenter,zfs_iscsi -s shared,ssh,ceph,fs_lvm,qcow2,vcenter,zfs_iscsi"
+]
+.......
+TM_MAD_CONF = [
+    NAME = "zfs_iscsi", LN_TARGET = "NONE", CLONE_TARGET = "SELF", SHARED = "YES",
+    DS_MIGRATE = "NO", DRIVER = "raw", ALLOW_ORPHANS="mixed",
+    TM_MAD_SYSTEM = "ssh,shared", LN_TARGET_SSH = "SYSTEM", CLONE_TARGET_SSH = "SYSTEM",
+    DISK_TYPE_SSH = "FILE", TM_MAD_SYSTEM = "shared", LN_TARGET_SHARED = "NONE",
+    CLONE_TARGET_SHARED = "SELF", DISK_TYPE_SHARED = "ISCSI"
+]
+.......
+DS_MAD_CONF = [
+    NAME = "zfs_iscsi",
+    REQUIRED_ATTRS = "DISK_TYPE,ISCSI_HOST",
+    PERSISTENT_ONLY = "NO",
+    MARKETPLACE_ACTIONS = "export"
+]
+
+#NODE KVM
+-Generate ISCSI Secret
+
+cat > /tmp/iscsi-secret.xml << EOF
+<secret ephemeral='no' private='no'>
+   <description>Passphrase for the iSCSI "ISCSI_FQDN" server</description>
+   <usage type='iscsi'>
+      <target>libvirtiscsi</target>
+   </usage>
+</secret>
+EOF
+
+virsh secret-define /tmp/iscsi-secret.xml
+rm /tmp/iscsi-secret.xml
+
+MYCHAP=<chap password here>
+secret_UUID=$(virsh -q secret-list | awk '{print $1}')
+MYSECRET=$(printf %s "$MYCHAP" | base64)
+
+virsh secret-set-value $secret_UUID --base64 $MYSECRET
+
+
+###ONED PATCH (recompile /usr/bin/oned)
+./include/Image.h
+
+--- ../../opennebula-6.0.0.2/./include/Image.h	2021-05-24 21:07:32.000000000 +0200
++++ ./include/Image.h	2021-10-12 20:35:17.492000000 +0200
+@@ -85,6 +85,7 @@
+         SHEEPDOG       = 7, /** < Sheepdog Block Device */
+         SHEEPDOG_CDROM = 8, /** < Sheepdog CDROM Device Device */
+         ISCSI          = 9, /** < iSCSI Volume (Devices Datastore) */
++        ISCSI_CDROM    = 10, /** < iSCSI CDROM (Devices Datastore) */
+         NONE           = 255 /** < No disk type, error situation */
+     };
+ 
+@@ -107,6 +108,7 @@
+             case SHEEPDOG:       return "SHEEPDOG" ; break;
+             case SHEEPDOG_CDROM: return "SHEEPDOG_CDROM" ; break;
+             case ISCSI:          return "ISCSI" ; break;
++            case ISCSI_CDROM:    return "ISCSI_CDROM" ; break;
+             default:             return "";
+         }
+     };
+
+
+./src/vm/VirtualMachineDisk.cc
+
+--- ../../opennebula-6.0.0.2/./src/vm/VirtualMachineDisk.cc	2021-05-24 21:07:33.000000000 +0200
++++ ./src/vm/VirtualMachineDisk.cc	2021-10-12 20:44:11.480000000 +0200
+@@ -534,8 +534,9 @@
+         case Image::RBD_CDROM:
+         case Image::GLUSTER_CDROM:
+         case Image::SHEEPDOG_CDROM:
++        case Image::ISCSI_CDROM:
+         case Image::CD_ROM:
+-            if (ds_name != "FILE" && ds_name != "ISCSI" && ds_name != "NONE")
++            if (ds_name != "FILE" && ds_name != "NONE")
+             {
+                 replace("TYPE", ds_name+"_CDROM");
+             }
+
+
+./src/image/Image.cc
+
+--- ../../opennebula-6.0.0.2/./src/image/Image.cc	2021-05-24 21:07:33.000000000 +0200
++++ ./src/image/Image.cc	2021-10-12 20:47:03.268000000 +0200
+@@ -667,6 +667,10 @@
+                     new_disk_type = GLUSTER_CDROM;
+                     break;
+ 
++                case ISCSI:
++                    new_disk_type = ISCSI_CDROM;
++                    break;
++
+                 default:
+                     new_disk_type = CD_ROM;
+             }
+@@ -943,6 +947,10 @@
+     {
+         type = Image::ISCSI;
+     }
++    else if (s_disk_type == "ISCSI_CDROM")
++    {
++        type = Image::ISCSI_CDROM;
++    }
+ 
+     return type;
+ }
+
+
+
+./src/datastore/Datastore.cc
+
+--- ../../opennebula-6.0.0.2/./src/datastore/Datastore.cc	2021-05-24 21:07:33.000000000 +0200
++++ ./src/datastore/Datastore.cc	2021-10-12 20:52:31.120000000 +0200
+@@ -550,6 +550,7 @@
+                 case Image::CD_ROM:
+                 case Image::RBD_CDROM:
+                 case Image::SHEEPDOG_CDROM:
++                case Image::ISCSI_CDROM:
+                 case Image::GLUSTER_CDROM:
+                     error = "Invalid DISK_TYPE for an Image Datastore.";
+                     return -1;
+@@ -575,6 +576,7 @@
+                 case Image::CD_ROM:
+                 case Image::RBD_CDROM:
+                 case Image::SHEEPDOG_CDROM:
++                case Image::ISCSI_CDROM:
+                 case Image::GLUSTER_CDROM:
+                     error = "Invalid DISK_TYPE for a System Datastore.";
+                     return -1;
+
+
+
+./src/vmm/LibVirtDriverKVM.cc
+
+--- ../../opennebula-6.0.0.2/./src/vmm/LibVirtDriverKVM.cc	2021-05-24 21:07:33.000000000 +0200
++++ ./src/vmm/LibVirtDriverKVM.cc	2021-10-18 23:03:12.952000000 +0200
+@@ -1007,9 +1007,16 @@
+             file << "\t\t\t<source dev=" << one_util::escape_xml_attr(dev.str())
+                  << "/>" << endl;
+         }
+-        else if ( type == "ISCSI" )
++        else if ( type == "ISCSI" || type == "ISCSI_CDROM" || !iscsi_host.empty() )
+         {
+-            file << "\t\t<disk type='network' device='disk'>" << endl;
++            if (type == "ISCSI_CDROM")
++            {
++                file << "\t\t<disk type='network' device='cdrom'>" << endl;
++            }
++            else
++            {
++                file << "\t\t<disk type='network' device='disk'>" << endl;
++            }
+ 
+             file << "\t\t\t<source protocol='iscsi' name=";
+ 
+@@ -1017,9 +1024,20 @@
+             {
+                 file << one_util::escape_xml_attr(iscsi_iqn);
+             }
++	    else if ( source.empty() )
++	    {
++                file << "'iqn.2008-07.org.opennebula:one-sys-" << vm->get_oid() << "-" << disk_id << "'";
++	    }
+             else
+-            {
+-                file << one_util::escape_xml_attr(source);
++	    {
++               if ( clone == "YES" )
++               {
++                  file << "'" << one_util::trim(source) << "-" << vm->get_oid() << "-" << disk_id << "'";
++               }
++               else
++               {
++                  file << one_util::escape_xml_attr(source);
++               }
+             }
+ 
+             do_network_hosts(file, iscsi_host, "", ISCSI_DEFAULT_PORT);
+
+
+
+
+
+
+
